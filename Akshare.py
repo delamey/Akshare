@@ -98,6 +98,9 @@ _warmup_done = threading.Event()
 _warmup_started = False
 _warmup_started_lock = threading.Lock()
 _warmup_thread_ref: Optional[threading.Thread] = None
+_CACHE_FAIL_COOLDOWN = 30  # 缓存获取失败后30秒内不再重试
+_cache_fail_times: Dict[str, float] = {}  # {source: last_fail_timestamp}
+_stock_name_map: Dict[str, str] = {}  # {code: name} 名称映射缓存
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -202,6 +205,11 @@ def _get_cached_market_data(source: str = "em", silent: bool = False) -> pd.Data
             if now - cached_ts < _CACHE_TTL:
                 return data
 
+    last_fail = _cache_fail_times.get(source, 0)
+    if now - last_fail < _CACHE_FAIL_COOLDOWN:
+        with _market_cache_lock:
+            return _market_cache.get(source, (pd.DataFrame(), 0))[0]
+
     _check_warmup_thread_health()
 
     try:
@@ -212,12 +220,17 @@ def _get_cached_market_data(source: str = "em", silent: bool = False) -> pd.Data
         else:
             df = pd.DataFrame()
         if df is not None and not df.empty:
+            _cache_fail_times.pop(source, None)
             with _market_cache_lock:
                 _market_cache[source] = (df, now)
+                if source == "em" and '代码' in df.columns and '名称' in df.columns:
+                    _stock_name_map.update(dict(zip(df['代码'], df['名称'])))
         return df if df is not None else pd.DataFrame()
     except Exception as e:
+        _cache_fail_times[source] = now
         if not silent:
-            log_warning(f"缓存全市场数据({source})失败: {type(e).__name__}: {str(e)[:60]}")
+            if last_fail == 0:
+                log_warning(f"缓存全市场数据({source})失败: {type(e).__name__}: {str(e)[:60]}")
         with _market_cache_lock:
             return _market_cache.get(source, (pd.DataFrame(), 0))[0]
 
@@ -3787,7 +3800,7 @@ class TechnicalIndicators:
     def calculate_ma(df: pd.DataFrame, periods: List[int] = [5, 10, 20, 50, 200]) -> pd.DataFrame:
         """计算移动平均线"""
         for period in periods:
-            df[f'MA{period}'] = df['收盘'].rolling(window=period).mean()
+            df[f'MA{period}'] = df['收盘'].rolling(window=period, min_periods=1).mean()
         return df
     
     @staticmethod
@@ -3816,8 +3829,8 @@ class TechnicalIndicators:
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
         
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
+        avg_gain = gain.rolling(window=period, min_periods=1).mean()
+        avg_loss = loss.rolling(window=period, min_periods=1).mean()
         
         rs = avg_gain / avg_loss
         df[f'RSI_{period}'] = 100 - (100 / (1 + rs))
@@ -3827,8 +3840,8 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_kdj(df: pd.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pd.DataFrame:
         """计算KDJ指标"""
-        low_n = df['最低'].rolling(window=n).min()
-        high_n = df['最高'].rolling(window=n).max()
+        low_n = df['最低'].rolling(window=n, min_periods=1).min()
+        high_n = df['最高'].rolling(window=n, min_periods=1).max()
         
         rsv = (df['收盘'] - low_n) / (high_n - low_n) * 100
         rsv = rsv.fillna(50)
@@ -3842,8 +3855,8 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_bollinger(df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> pd.DataFrame:
         """计算布林带"""
-        df['BB_MID'] = df['收盘'].rolling(window=period).mean()
-        df['BB_STD'] = df['收盘'].rolling(window=period).std()
+        df['BB_MID'] = df['收盘'].rolling(window=period, min_periods=1).mean()
+        df['BB_STD'] = df['收盘'].rolling(window=period, min_periods=1).std()
         df['BB_UPPER'] = df['BB_MID'] + std_dev * df['BB_STD']
         df['BB_LOWER'] = df['BB_MID'] - std_dev * df['BB_STD']
         
@@ -3859,7 +3872,7 @@ class TechnicalIndicators:
         if volume_col is None:
             return df
         for period in periods:
-            df[f'VOL_MA{period}'] = df[volume_col].rolling(window=period).mean()
+            df[f'VOL_MA{period}'] = df[volume_col].rolling(window=period, min_periods=1).mean()
         return df
 
 
@@ -3894,6 +3907,8 @@ class L1Screener:
         self.df = None
         self.realtime_data = None
         self.indicators = TechnicalIndicators()
+        self._latest_row = None
+        self._prev_row = None
         
     def load_data(self, days: int = 250, indicators: Optional[List[str]] = None) -> bool:
         """加载数据
@@ -3917,6 +3932,10 @@ class L1Screener:
             if self.df is not None and not self.df.empty:
                 _ld_i0 = time.perf_counter()
                 self._calculate_indicators(indicators)
+                if len(self.df) >= 1:
+                    self._latest_row = self.df.iloc[-1]
+                if len(self.df) >= 2:
+                    self._prev_row = self.df.iloc[-2]
                 _ld_i1 = time.perf_counter()
                 _ld_total = time.perf_counter()
                 log_info(
@@ -3983,8 +4002,8 @@ class L1Screener:
         if self.df is None or len(self.df) < 11:
             return {'signal': False, 'description': '数据不足'}
         
-        latest = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
+        latest = self._latest_row if self._latest_row is not None else self.df.iloc[-1]
+        prev = self._prev_row if self._prev_row is not None else self.df.iloc[-2]
         prev2 = self.df.iloc[-3]
         
         # 当日MA5 > MA10，前一日MA5 <= MA10（金叉）
@@ -4068,8 +4087,8 @@ class L1Screener:
         if self.df is None or len(self.df) < 3:
             return {'signal': False, 'description': '数据不足'}
         
-        latest = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
+        latest = self._latest_row if self._latest_row is not None else self.df.iloc[-1]
+        prev = self._prev_row if self._prev_row is not None else self.df.iloc[-2]
         
         dif = latest.get('DIF', 0)
         dea = latest.get('DEA', 0)
@@ -4155,7 +4174,7 @@ class L1Screener:
         if self.df is None:
             return {'signal': False, 'description': '数据不足'}
         
-        latest = self.df.iloc[-1]
+        latest = self._latest_row if self._latest_row is not None else self.df.iloc[-1]
         rsi = latest.get('RSI_14', 50)
         
         overbought = rsi > 70
@@ -4211,7 +4230,7 @@ class L1Screener:
         if self.df is None or len(self.df) < 6:
             return {'signal': False, 'description': '数据不足'}
         
-        latest = self.df.iloc[-1]
+        latest = self._latest_row if self._latest_row is not None else self.df.iloc[-1]
         volume = latest.get('成交量', 0)
         vol_ma5 = latest.get('VOL_MA5', 0)
         
@@ -4676,6 +4695,18 @@ class L2Screener:
 
 # 第十三部分：三种投资策略评估引擎
 
+def _make_detail(name: str, max_score: int, actual_score: int,
+                 status: str, value: str, threshold: str, basis: str) -> Dict[str, Any]:
+    return {
+        'name': name,
+        'max_score': max_score,
+        'actual_score': actual_score,
+        'status': status,
+        'value': value,
+        'threshold': threshold,
+        'basis': basis,
+    }
+
 _STRATEGY_DATA_CONFIG = {
     '1': {
         'hist_days': 20,
@@ -4782,7 +4813,6 @@ class ScreeningStrategies:
         if not self.load_all_data('1'):
             return {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'}
         _t_load = time.perf_counter()
-        log_info(f"[短线强势] {self.stock_code} 数据加载: {_t_load - _t0:.3f}s")
         
         l1 = self.l1_screener
         l2 = self.l2_screener
@@ -4796,25 +4826,19 @@ class ScreeningStrategies:
         log_info(f"[短线强势] {self.stock_code} 均线金叉检测: {_t2 - _t1:.4f}s")
         if ma_check['signal']:
             score += 20
-            details.append({
-                'name': '均线系统（金叉）',
-                'max_score': 20,
-                'actual_score': 20,
-                'status': 'passed',
-                'value': f'MA5={ma_check["MA5"]:.2f}, MA10={ma_check["MA10"]:.2f}',
-                'threshold': 'MA5 > MA10 且前一日 MA5 <= MA10',
-                'basis': '当日5日均线上穿10日均线，形成金叉信号'
-            })
+            details.append(_make_detail(
+                '均线系统（金叉）', 20, 20, 'passed',
+                f'MA5={ma_check["MA5"]:.2f}, MA10={ma_check["MA10"]:.2f}',
+                'MA5 > MA10 且前一日 MA5 <= MA10',
+                '当日5日均线上穿10日均线，形成金叉信号'
+            ))
         else:
-            details.append({
-                'name': '均线系统（金叉）',
-                'max_score': 20,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'MA5={ma_check.get("MA5", "N/A")}, MA10={ma_check.get("MA10", "N/A")}',
-                'threshold': 'MA5 > MA10 且前一日 MA5 <= MA10',
-                'basis': '未出现金叉信号，均线未形成多头排列'
-            })
+            details.append(_make_detail(
+                '均线系统（金叉）', 20, 0, 'failed',
+                f'MA5={ma_check.get("MA5", "N/A")}, MA10={ma_check.get("MA10", "N/A")}',
+                'MA5 > MA10 且前一日 MA5 <= MA10',
+                '未出现金叉信号，均线未形成多头排列'
+            ))
         
         if l1.df is not None and not l1.df.empty:
             latest = l1.df.iloc[-1]
@@ -4823,50 +4847,38 @@ class ScreeningStrategies:
             price_change = 0
         if price_change > 3:
             score += 20
-            details.append({
-                'name': '当日涨幅强劲',
-                'max_score': 20,
-                'actual_score': 20,
-                'status': 'passed',
-                'value': f'{price_change:.2f}%',
-                'threshold': '涨跌幅 > 3%',
-                'basis': '当日涨幅超过3%，表明短期动能强劲'
-            })
+            details.append(_make_detail(
+                '当日涨幅强劲', 20, 20, 'passed',
+                f'{price_change:.2f}%',
+                '涨跌幅 > 3%',
+                '当日涨幅超过3%，表明短期动能强劲'
+            ))
         else:
-            details.append({
-                'name': '当日涨幅强劲',
-                'max_score': 20,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'{price_change:.2f}%',
-                'threshold': '涨跌幅 > 3%',
-                'basis': f'当日涨幅仅{price_change:.2f}%，未达到3%的强势标准' if l1.df is not None else 'L1数据缺失，无法判断涨跌幅'
-            })
+            details.append(_make_detail(
+                '当日涨幅强劲', 20, 0, 'failed',
+                f'{price_change:.2f}%',
+                '涨跌幅 > 3%',
+                f'当日涨幅仅{price_change:.2f}%，未达到3%的强势标准' if l1.df is not None else 'L1数据缺失，无法判断涨跌幅'
+            ))
         
         vol_check = l1.check_volume_surge()
         _t3 = time.perf_counter()
         log_info(f"[短线强势] {self.stock_code} 成交量检测: {_t3 - _t2:.4f}s")
         if vol_check['signal']:
             score += 20
-            details.append({
-                'name': '成交量放大',
-                'max_score': 20,
-                'actual_score': 20,
-                'status': 'passed',
-                'value': f'量比 {vol_check["放大倍数"]:.2f}倍',
-                'threshold': '成交量 > 5日均量 × 1.5',
-                'basis': f'成交量放大至5日均量的{vol_check["放大倍数"]:.2f}倍，资金参与度高'
-            })
+            details.append(_make_detail(
+                '成交量放大', 20, 20, 'passed',
+                f'量比 {vol_check["放大倍数"]:.2f}倍',
+                '成交量 > 5日均量 × 1.5',
+                f'成交量放大至5日均量的{vol_check["放大倍数"]:.2f}倍，资金参与度高'
+            ))
         else:
-            details.append({
-                'name': '成交量放大',
-                'max_score': 20,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'量比 {vol_check.get("放大倍数", 0):.2f}倍',
-                'threshold': '成交量 > 5日均量 × 1.5',
-                'basis': f'成交量仅{vol_check.get("放大倍数", 0):.2f}倍均量，资金参与度不足'
-            })
+            details.append(_make_detail(
+                '成交量放大', 20, 0, 'failed',
+                f'量比 {vol_check.get("放大倍数", 0):.2f}倍',
+                '成交量 > 5日均量 × 1.5',
+                f'成交量仅{vol_check.get("放大倍数", 0):.2f}倍均量，资金参与度不足'
+            ))
         
         rsi_check = l1.check_rsi_overbought()
         _t4 = time.perf_counter()
@@ -4874,86 +4886,65 @@ class ScreeningStrategies:
         rsi_value = rsi_check.get('RSI', 0) or 0
         if not rsi_check['signal']:
             score += 10
-            details.append({
-                'name': 'RSI 未超买',
-                'max_score': 10,
-                'actual_score': 10,
-                'status': 'passed',
-                'value': f'RSI_14 = {rsi_value:.2f}',
-                'threshold': 'RSI_14 < 70',
-                'basis': 'RSI未进入超买区间，短期回调风险可控'
-            })
+            details.append(_make_detail(
+                'RSI 未超买', 10, 10, 'passed',
+                f'RSI_14 = {rsi_value:.2f}',
+                'RSI_14 < 70',
+                'RSI未进入超买区间，短期回调风险可控'
+            ))
         else:
-            details.append({
-                'name': 'RSI 未超买',
-                'max_score': 10,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'RSI_14 = {rsi_value:.2f}',
-                'threshold': 'RSI_14 < 70',
-                'basis': f'RSI达{rsi_value:.2f}，已进入超买区间，追高风险较大'
-            })
+            details.append(_make_detail(
+                'RSI 未超买', 10, 0, 'failed',
+                f'RSI_14 = {rsi_value:.2f}',
+                'RSI_14 < 70',
+                f'RSI达{rsi_value:.2f}，已进入超买区间，追高风险较大'
+            ))
         
         l2_data = l2.get_l2_indicators()
         _t5 = time.perf_counter()
         log_info(f"[短线强势] {self.stock_code} L2指标计算: {_t5 - _t4:.4f}s")
         
-        if l2_data['DDX'] > 0.5:
+        ddx = l2_data['DDX']
+        if ddx > 0.5:
             score += 15
-            details.append({
-                'name': 'DDX 大单动向',
-                'max_score': 15,
-                'actual_score': 15,
-                'status': 'passed',
-                'value': f'DDX = {l2_data["DDX"]:.4f}',
-                'threshold': 'DDX > 0.5 满分，DDX > 0 部分得分',
-                'basis': f'DDX达{l2_data["DDX"]:.4f}，大单资金大幅流入，主力做多意愿强'
-            })
-        elif l2_data['DDX'] > 0:
+            details.append(_make_detail(
+                'DDX 大单动向', 15, 15, 'passed',
+                f'DDX = {ddx:.4f}',
+                'DDX > 0.5 满分，DDX > 0 部分得分',
+                f'DDX达{ddx:.4f}，大单资金大幅流入，主力做多意愿强'
+            ))
+        elif ddx > 0:
             score += 5
-            details.append({
-                'name': 'DDX 大单动向',
-                'max_score': 15,
-                'actual_score': 5,
-                'status': 'partial',
-                'value': f'DDX = {l2_data["DDX"]:.4f}',
-                'threshold': 'DDX > 0.5 满分，DDX > 0 部分得分',
-                'basis': f'DDX为{l2_data["DDX"]:.4f}，虽为正但未达强势阈值0.5'
-            })
+            details.append(_make_detail(
+                'DDX 大单动向', 15, 5, 'partial',
+                f'DDX = {ddx:.4f}',
+                'DDX > 0.5 满分，DDX > 0 部分得分',
+                f'DDX为{ddx:.4f}，虽为正但未达强势阈值0.5'
+            ))
         else:
-            details.append({
-                'name': 'DDX 大单动向',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'DDX = {l2_data["DDX"]:.4f}',
-                'threshold': 'DDX > 0.5 满分，DDX > 0 部分得分',
-                'basis': f'DDX为{l2_data["DDX"]:.4f}，大单资金净流出'
-            })
+            details.append(_make_detail(
+                'DDX 大单动向', 15, 0, 'failed',
+                f'DDX = {ddx:.4f}',
+                'DDX > 0.5 满分，DDX > 0 部分得分',
+                f'DDX为{ddx:.4f}，大单资金净流出'
+            ))
         
-        if l2_data['主力净额'] > 0:
+        net_amount = l2_data['主力净额']
+        if net_amount > 0:
             score += 15
-            net_amount = l2_data['主力净额']
-            details.append({
-                'name': '主力净流入',
-                'max_score': 15,
-                'actual_score': 15,
-                'status': 'passed',
-                'value': f'主力净额 = {net_amount/10000:.2f}万',
-                'threshold': '主力净额 > 0',
-                'basis': f'主力资金净流入{net_amount/10000:.2f}万，资金面积极'
-            })
+            details.append(_make_detail(
+                '主力净流入', 15, 15, 'passed',
+                f'主力净额 = {net_amount/10000:.2f}万',
+                '主力净额 > 0',
+                f'主力资金净流入{net_amount/10000:.2f}万，资金面积极'
+            ))
         else:
-            net_amount = l2_data['主力净额']
-            details.append({
-                'name': '主力净流入',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'主力净额 = {abs(net_amount)/10000:.2f}万（流出）',
-                'threshold': '主力净额 > 0',
-                'basis': f'主力资金净流出{abs(net_amount)/10000:.2f}万，资金面偏空'
-            })
+            details.append(_make_detail(
+                '主力净流入', 15, 0, 'failed',
+                f'主力净额 = {abs(net_amount)/10000:.2f}万（流出）',
+                '主力净额 > 0',
+                f'主力资金净流出{abs(net_amount)/10000:.2f}万，资金面偏空'
+            ))
         
         _t_end = time.perf_counter()
         log_info(f"[短线强势] {self.stock_code} 总耗时: {_t_end - _t0:.3f}s (计算: {_t_end - _t_load:.3f}s)")
@@ -4969,7 +4960,6 @@ class ScreeningStrategies:
         if not self.load_all_data('2'):
             return {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'}
         _t_load = time.perf_counter()
-        log_info(f"[主力建仓] {self.stock_code} 数据加载: {_t_load - _t0:.3f}s")
         
         l1 = self.l1_screener
         l2 = self.l2_screener
@@ -4985,35 +4975,23 @@ class ScreeningStrategies:
             
             if decline_3m > -30:
                 score += 15
-                details.append({
-                    'name': '股价相对低位',
-                    'max_score': 15,
-                    'actual_score': 15,
-                    'status': 'passed',
-                    'value': f'近60天跌幅 {decline_3m:.1f}%',
-                    'threshold': '近60天跌幅 > -30%',
-                    'basis': f'近60天跌幅仅{decline_3m:.1f}%，股价处于相对安全区间'
-                })
+                details.append(_make_detail(
+                    '股价相对低位', 15, 15, 'passed',
+                    f'近60天跌幅 {decline_3m:.1f}%', '近60天跌幅 > -30%',
+                    f'近60天跌幅仅{decline_3m:.1f}%，股价处于相对安全区间'
+                ))
             else:
-                details.append({
-                    'name': '股价相对低位',
-                    'max_score': 15,
-                    'actual_score': 0,
-                    'status': 'failed',
-                    'value': f'近60天跌幅 {decline_3m:.1f}%',
-                    'threshold': '近60天跌幅 > -30%',
-                    'basis': f'近60天跌幅达{decline_3m:.1f}%，下跌幅度过大'
-                })
+                details.append(_make_detail(
+                    '股价相对低位', 15, 0, 'failed',
+                    f'近60天跌幅 {decline_3m:.1f}%', '近60天跌幅 > -30%',
+                    f'近60天跌幅达{decline_3m:.1f}%，下跌幅度过大'
+                ))
         else:
-            details.append({
-                'name': '股价相对低位',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': '数据不足（需60天K线）',
-                'threshold': '近60天跌幅 > -30%',
-                'basis': 'K线数据不足60天，无法判断价格位置'
-            })
+            details.append(_make_detail(
+                '股价相对低位', 15, 0, 'failed',
+                '数据不足（需60天K线）', '近60天跌幅 > -30%',
+                'K线数据不足60天，无法判断价格位置'
+            ))
         
         vol_trend = l2.check_ddx_continuous_positive()
         _t2 = time.perf_counter()
@@ -5021,25 +4999,17 @@ class ScreeningStrategies:
         positive_days = vol_trend.get('正天数', 0)
         if vol_trend['signal']:
             score += 20
-            details.append({
-                'name': '成交量逐步放大',
-                'max_score': 20,
-                'actual_score': 20,
-                'status': 'passed',
-                'value': f'近5日{positive_days}天涨跌幅>0',
-                'threshold': '近5日涨跌幅>0天数 >= 3',
-                'basis': f'近5日中有{positive_days}天上涨，成交量呈现逐步放大趋势'
-            })
+            details.append(_make_detail(
+                '成交量逐步放大', 20, 20, 'passed',
+                f'近5日{positive_days}天涨跌幅>0', '近5日涨跌幅>0天数 >= 3',
+                f'近5日中有{positive_days}天上涨，成交量呈现逐步放大趋势'
+            ))
         else:
-            details.append({
-                'name': '成交量逐步放大',
-                'max_score': 20,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'近5日{positive_days}天涨跌幅>0',
-                'threshold': '近5日涨跌幅>0天数 >= 3',
-                'basis': f'近5日仅{positive_days}天上涨，成交量未持续放大'
-            })
+            details.append(_make_detail(
+                '成交量逐步放大', 20, 0, 'failed',
+                f'近5日{positive_days}天涨跌幅>0', '近5日涨跌幅>0天数 >= 3',
+                f'近5日仅{positive_days}天上涨，成交量未持续放大'
+            ))
         
         macd_check = l1.check_macd_golden_cross()
         _t3 = time.perf_counter()
@@ -5053,108 +5023,74 @@ class ScreeningStrategies:
         macd_close = latest_dif > latest_dea * 0.9
         if macd_check['signal']:
             score += 20
-            details.append({
-                'name': 'MACD 金叉',
-                'max_score': 20,
-                'actual_score': 20,
-                'status': 'passed',
-                'value': f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}',
-                'threshold': 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
-                'basis': 'MACD形成金叉信号，DIF上穿DEA，趋势转多'
-            })
+            details.append(_make_detail(
+                'MACD 金叉', 20, 20, 'passed',
+                f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}', 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
+                'MACD形成金叉信号，DIF上穿DEA，趋势转多'
+            ))
         elif macd_close:
             score += 10
-            details.append({
-                'name': 'MACD 金叉',
-                'max_score': 20,
-                'actual_score': 10,
-                'status': 'partial',
-                'value': f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}',
-                'threshold': 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
-                'basis': f'DIF接近DEA（DIF/DEA={latest_dif/max(latest_dea,0.0001):.2f}），即将形成金叉'
-            })
+            details.append(_make_detail(
+                'MACD 金叉', 20, 10, 'partial',
+                f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}', 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
+                f'DIF接近DEA（DIF/DEA={latest_dif/max(latest_dea,0.0001):.2f}），即将形成金叉'
+            ))
         else:
-            details.append({
-                'name': 'MACD 金叉',
-                'max_score': 20,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}',
-                'threshold': 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
-                'basis': 'DIF与DEA差距较大，暂未出现金叉信号'
-            })
+            details.append(_make_detail(
+                'MACD 金叉', 20, 0, 'failed',
+                f'DIF={latest_dif:.4f}, DEA={latest_dea:.4f}', 'MACD金叉(20分) / DIF>=DEA×0.9(10分)',
+                'DIF与DEA差距较大，暂未出现金叉信号'
+            ))
         
         l2_data = l2.get_l2_indicators()
         _t4 = time.perf_counter()
         log_info(f"[主力建仓] {self.stock_code} L2指标计算: {_t4 - _t3:.4f}s")
         
-        if l2_data['DDX_5日均值'] > 0:
-            score += 15
-            details.append({
-                'name': 'DDX 持续为正',
-                'max_score': 15,
-                'actual_score': 15,
-                'status': 'passed',
-                'value': f'DDX_5日均值 = {l2_data["DDX_5日均值"]:.4f}',
-                'threshold': 'DDX_5日均值 > 0',
-                'basis': f'DDX近5日均值为{l2_data["DDX_5日均值"]:.4f}，大单资金持续流入'
-            })
-        else:
-            details.append({
-                'name': 'DDX 持续为正',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'DDX_5日均值 = {l2_data["DDX_5日均值"]:.4f}',
-                'threshold': 'DDX_5日均值 > 0',
-                'basis': f'DDX近5日均值为{l2_data["DDX_5日均值"]:.4f}，大单资金未持续流入'
-            })
+        ddx_5_avg = l2_data['DDX_5日均值']
+        ddy_5_trend = l2_data['DDY_5日趋势']
+        main_net = l2_data['主力净额']
         
-        if l2_data['DDY_5日趋势'] > 0:
+        if ddx_5_avg > 0:
             score += 15
-            details.append({
-                'name': 'DDY 上升趋势',
-                'max_score': 15,
-                'actual_score': 15,
-                'status': 'passed',
-                'value': f'DDY_5日趋势 = {l2_data["DDY_5日趋势"]:.4f}',
-                'threshold': 'DDY_5日趋势 > 0',
-                'basis': f'DDY近5日趋势值为{l2_data["DDY_5日趋势"]:.4f}，涨跌动因持续上升'
-            })
+            details.append(_make_detail(
+                'DDX 持续为正', 15, 15, 'passed',
+                f'DDX_5日均值 = {ddx_5_avg:.4f}', 'DDX_5日均值 > 0',
+                f'DDX近5日均值为{ddx_5_avg:.4f}，大单资金持续流入'
+            ))
         else:
-            details.append({
-                'name': 'DDY 上升趋势',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'DDY_5日趋势 = {l2_data["DDY_5日趋势"]:.4f}',
-                'threshold': 'DDY_5日趋势 > 0',
-                'basis': f'DDY近5日趋势为{l2_data["DDY_5日趋势"]:.4f}，涨跌动因未呈上升态势'
-            })
+            details.append(_make_detail(
+                'DDX 持续为正', 15, 0, 'failed',
+                f'DDX_5日均值 = {ddx_5_avg:.4f}', 'DDX_5日均值 > 0',
+                f'DDX近5日均值为{ddx_5_avg:.4f}，大单资金未持续流入'
+            ))
         
-        if l2_data['主力净额'] > 0:
+        if ddy_5_trend > 0:
             score += 15
-            net_amount = l2_data['主力净额']
-            details.append({
-                'name': '主力净流入',
-                'max_score': 15,
-                'actual_score': 15,
-                'status': 'passed',
-                'value': f'主力净额 = {net_amount/10000:.2f}万',
-                'threshold': '主力净额 > 0',
-                'basis': f'主力资金净流入{net_amount/10000:.2f}万，资金面支持建仓'
-            })
+            details.append(_make_detail(
+                'DDY 上升趋势', 15, 15, 'passed',
+                f'DDY_5日趋势 = {ddy_5_trend:.4f}', 'DDY_5日趋势 > 0',
+                f'DDY近5日趋势值为{ddy_5_trend:.4f}，涨跌动因持续上升'
+            ))
         else:
-            net_amount = l2_data['主力净额']
-            details.append({
-                'name': '主力净流入',
-                'max_score': 15,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': f'主力净额 = {abs(net_amount)/10000:.2f}万（流出）',
-                'threshold': '主力净额 > 0',
-                'basis': f'主力资金净流出{abs(net_amount)/10000:.2f}万，暂未出现建仓迹象'
-            })
+            details.append(_make_detail(
+                'DDY 上升趋势', 15, 0, 'failed',
+                f'DDY_5日趋势 = {ddy_5_trend:.4f}', 'DDY_5日趋势 > 0',
+                f'DDY近5日趋势为{ddy_5_trend:.4f}，涨跌动因未呈上升态势'
+            ))
+        
+        if main_net > 0:
+            score += 15
+            details.append(_make_detail(
+                '主力净流入', 15, 15, 'passed',
+                f'主力净额 = {main_net/10000:.2f}万', '主力净额 > 0',
+                f'主力资金净流入{main_net/10000:.2f}万，资金面支持建仓'
+            ))
+        else:
+            details.append(_make_detail(
+                '主力净流入', 15, 0, 'failed',
+                f'主力净额 = {abs(main_net)/10000:.2f}万（流出）', '主力净额 > 0',
+                f'主力资金净流出{abs(main_net)/10000:.2f}万，暂未出现建仓迹象'
+            ))
         
         _t_end = time.perf_counter()
         log_info(f"[主力建仓] {self.stock_code} 总耗时: {_t_end - _t0:.3f}s (计算: {_t_end - _t_load:.3f}s)")
@@ -5171,164 +5107,99 @@ class ScreeningStrategies:
             return {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'}
         _t_load = time.perf_counter()
         log_info(f"[价值投资] {self.stock_code} 数据加载: {_t_load - _t0:.3f}s")
-        
+
         l1 = self.l1_screener
-        
+
         score = 0
         details = []
-        
+
         pe = None
-        _t1 = time.perf_counter()
         if l1.realtime_data:
             pe = l1.realtime_data.get('市盈率-动态', 0)
             if pe and 0 < pe < 30:
                 score += 25
-                details.append({
-                    'name': '市盈率(PE)合理',
-                    'max_score': 25,
-                    'actual_score': 25,
-                    'status': 'passed',
-                    'value': f'PE = {pe:.1f}',
-                    'threshold': '0 < PE < 30',
-                    'basis': f'市盈率{pe:.1f}处于合理估值区间，估值安全边际好'
-                })
+                details.append(_make_detail(
+                    '市盈率(PE)合理', 25, 25, 'passed',
+                    f'PE = {pe:.1f}', '0 < PE < 30',
+                    f'市盈率{pe:.1f}处于合理估值区间，估值安全边际好'))
             else:
-                details.append({
-                    'name': '市盈率(PE)合理',
-                    'max_score': 25,
-                    'actual_score': 0,
-                    'status': 'failed',
-                    'value': f'PE = {pe}',
-                    'threshold': '0 < PE < 30',
-                    'basis': f'市盈率{pe}不在合理范围（0~30），估值偏高或为亏损'
-                })
+                details.append(_make_detail(
+                    '市盈率(PE)合理', 25, 0, 'failed',
+                    f'PE = {pe}', '0 < PE < 30',
+                    f'市盈率{pe}不在合理范围（0~30），估值偏高或为亏损'))
         else:
-            details.append({
-                'name': '市盈率(PE)合理',
-                'max_score': 25,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': '无实时数据',
-                'threshold': '0 < PE < 30',
-                'basis': '无法获取实时市盈率数据'
-            })
-        
-        _t2 = time.perf_counter()
-        log_info(f"[价值投资] {self.stock_code} PE估值: {_t2 - _t1:.4f}s")
+            details.append(_make_detail(
+                '市盈率(PE)合理', 25, 0, 'failed',
+                '无实时数据', '0 < PE < 30',
+                '无法获取实时市盈率数据'))
+
         if l1.realtime_data:
             pb = l1.realtime_data.get('市净率', 0)
             if pb and 0 < pb < 3:
                 score += 25
-                details.append({
-                    'name': '市净率(PB)合理',
-                    'max_score': 25,
-                    'actual_score': 25,
-                    'status': 'passed',
-                    'value': f'PB = {pb:.2f}',
-                    'threshold': '0 < PB < 3',
-                    'basis': f'市净率{pb:.2f}处于合理区间，净资产支撑充分'
-                })
+                details.append(_make_detail(
+                    '市净率(PB)合理', 25, 25, 'passed',
+                    f'PB = {pb:.2f}', '0 < PB < 3',
+                    f'市净率{pb:.2f}处于合理区间，净资产支撑充分'))
             else:
-                details.append({
-                    'name': '市净率(PB)合理',
-                    'max_score': 25,
-                    'actual_score': 0,
-                    'status': 'failed',
-                    'value': f'PB = {pb}',
-                    'threshold': '0 < PB < 3',
-                    'basis': f'市净率{pb}不在合理范围（0~3），估值偏高或为负资产'
-                })
+                details.append(_make_detail(
+                    '市净率(PB)合理', 25, 0, 'failed',
+                    f'PB = {pb}', '0 < PB < 3',
+                    f'市净率{pb}不在合理范围（0~3），估值偏高或为负资产'))
         else:
-            details.append({
-                'name': '市净率(PB)合理',
-                'max_score': 25,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': '无实时数据',
-                'threshold': '0 < PB < 3',
-                'basis': '无法获取实时市净率数据'
-            })
-        
-        _t3 = time.perf_counter()
-        log_info(f"[价值投资] {self.stock_code} PB估值: {_t3 - _t2:.4f}s")
+            details.append(_make_detail(
+                '市净率(PB)合理', 25, 0, 'failed',
+                '无实时数据', '0 < PB < 3',
+                '无法获取实时市净率数据'))
+
         if l1.df is not None:
             latest = l1.df.iloc[-1]
             dif_val = latest.get('DIF', 0) or 0
             dea_val = latest.get('DEA', 0) or 0
             if dif_val > 0 and dea_val > 0:
                 score += 25
-                details.append({
-                    'name': 'MACD零轴上方',
-                    'max_score': 25,
-                    'actual_score': 25,
-                    'status': 'passed',
-                    'value': f'DIF={dif_val:.4f}, DEA={dea_val:.4f}',
-                    'threshold': 'DIF > 0 且 DEA > 0',
-                    'basis': 'MACD双线均在零轴上方，中长期趋势向好'
-                })
+                details.append(_make_detail(
+                    'MACD零轴上方', 25, 25, 'passed',
+                    f'DIF={dif_val:.4f}, DEA={dea_val:.4f}', 'DIF > 0 且 DEA > 0',
+                    'MACD双线均在零轴上方，中长期趋势向好'))
             else:
-                details.append({
-                    'name': 'MACD零轴上方',
-                    'max_score': 25,
-                    'actual_score': 0,
-                    'status': 'failed',
-                    'value': f'DIF={dif_val:.4f}, DEA={dea_val:.4f}',
-                    'threshold': 'DIF > 0 且 DEA > 0',
-                    'basis': 'MACD双线未同时在零轴上方，趋势尚未确认走强'
-                })
+                details.append(_make_detail(
+                    'MACD零轴上方', 25, 0, 'failed',
+                    f'DIF={dif_val:.4f}, DEA={dea_val:.4f}', 'DIF > 0 且 DEA > 0',
+                    'MACD双线未同时在零轴上方，趋势尚未确认走强'))
         else:
-            details.append({
-                'name': 'MACD零轴上方',
-                'max_score': 25,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': '无K线数据',
-                'threshold': 'DIF > 0 且 DEA > 0',
-                'basis': '无法获取K线数据，无法计算MACD'
-            })
-        
-        _t4 = time.perf_counter()
-        log_info(f"[价值投资] {self.stock_code} MACD计算: {_t4 - _t3:.4f}s")
+            details.append(_make_detail(
+                'MACD零轴上方', 25, 0, 'failed',
+                '无K线数据', 'DIF > 0 且 DEA > 0',
+                '无法获取K线数据，无法计算MACD'))
+
         if l1.df is not None and len(l1.df) >= 250:
             price_current = l1.df.iloc[-1]['收盘']
             price_1y_high = l1.df.tail(250)['最高'].max()
             ratio = price_current / price_1y_high if price_1y_high > 0 else 1
-            
+
             if price_current < price_1y_high * 0.7:
                 score += 25
-                details.append({
-                    'name': '股价相对低位',
-                    'max_score': 25,
-                    'actual_score': 25,
-                    'status': 'passed',
-                    'value': f'当前价{price_current:.2f}, 年高{price_1y_high:.2f}, 比例{ratio:.1%}',
-                    'threshold': '当前价 < 近250天最高价 × 0.7',
-                    'basis': f'当前价为年高点的{ratio:.1%}，处于相对低位，上涨空间大'
-                })
+                details.append(_make_detail(
+                    '股价相对低位', 25, 25, 'passed',
+                    f'当前价{price_current:.2f}, 年高{price_1y_high:.2f}, 比例{ratio:.1%}',
+                    '当前价 < 近250天最高价 × 0.7',
+                    f'当前价为年高点的{ratio:.1%}，处于相对低位，上涨空间大'))
             else:
-                details.append({
-                    'name': '股价相对低位',
-                    'max_score': 25,
-                    'actual_score': 0,
-                    'status': 'failed',
-                    'value': f'当前价{price_current:.2f}, 年高{price_1y_high:.2f}, 比例{ratio:.1%}',
-                    'threshold': '当前价 < 近250天最高价 × 0.7',
-                    'basis': f'当前价为年高点的{ratio:.1%}，价格相对较高，安全边际不足'
-                })
+                details.append(_make_detail(
+                    '股价相对低位', 25, 0, 'failed',
+                    f'当前价{price_current:.2f}, 年高{price_1y_high:.2f}, 比例{ratio:.1%}',
+                    '当前价 < 近250天最高价 × 0.7',
+                    f'当前价为年高点的{ratio:.1%}，价格相对较高，安全边际不足'))
         else:
-            details.append({
-                'name': '股价相对低位',
-                'max_score': 25,
-                'actual_score': 0,
-                'status': 'failed',
-                'value': '数据不足（需250天K线）',
-                'threshold': '当前价 < 近250天最高价 × 0.7',
-                'basis': 'K线数据不足250天，无法判断股价位置'
-            })
-        
+            details.append(_make_detail(
+                '股价相对低位', 25, 0, 'failed',
+                '数据不足（需250天K线）', '当前价 < 近250天最高价 × 0.7',
+                'K线数据不足250天，无法判断股价位置'))
+
         _t_end = time.perf_counter()
         log_info(f"[价值投资] {self.stock_code} 总耗时: {_t_end - _t0:.3f}s (计算: {_t_end - _t_load:.3f}s)")
-        
+
         return {
             'score': score,
             'max_score': 100,
@@ -5425,7 +5296,7 @@ class StockScreener:
             elif strategy == '3':
                 results['strategies']['价值投资股'] = screener.strategy_value_stocks()
         else:
-            if not screener.load_all_data('1'):
+            if not screener.load_all_data('all'):
                 results['strategies'] = {
                     '短线强势股': {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'},
                     '主力建仓股': {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'},
@@ -5435,9 +5306,7 @@ class StockScreener:
                 s1 = screener.strategy_short_term_strong()
                 results['strategies']['短线强势股'] = s1
 
-                s2 = {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'}
-                if screener.load_all_data('2'):
-                    s2 = screener.strategy_main_accumulation()
+                s2 = screener.strategy_main_accumulation()
                 results['strategies']['主力建仓股'] = s2
 
                 if s1.get('score', 0) < 30 and s2.get('score', 0) < 30:
@@ -5445,12 +5314,8 @@ class StockScreener:
                         'score': 0, 'max_score': 100, 'details': [],
                         'skip_reason': '短线/中线得分过低，跳过深度分析'
                     }
-                elif screener.load_all_data('3'):
-                    results['strategies']['价值投资股'] = screener.strategy_value_stocks()
                 else:
-                    results['strategies']['价值投资股'] = {
-                        'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'
-                    }
+                    results['strategies']['价值投资股'] = screener.strategy_value_stocks()
         
         total_score = 0
         strategy_count = 0
@@ -5472,16 +5337,22 @@ class StockScreener:
         return results
     
     def _get_stock_name(self, stock_code: str) -> str:
-        """内部方法：获取股票名称（优先复用缓存的全市场行情数据）"""
+        """内部方法：获取股票名称（优先从名称映射字典读取，O(1)查询）"""
         try:
-            df = _get_cached_market_data("em")
-            if df is not None and not df.empty:
-                code_col = '代码' if '代码' in df.columns else None
-                name_col = '名称' if '名称' in df.columns else None
-                if code_col and name_col:
-                    stock = df[df[code_col] == stock_code]
-                    if not stock.empty:
-                        return str(stock.iloc[0][name_col])
+            name = _stock_name_map.get(stock_code)
+            if name:
+                return name
+            with _market_cache_lock:
+                cached = _market_cache.get("em")
+            if cached is not None:
+                df, _ = cached
+                if df is not None and not df.empty:
+                    code_col = '代码' if '代码' in df.columns else None
+                    name_col = '名称' if '名称' in df.columns else None
+                    if code_col and name_col:
+                        row = df.loc[df[code_col] == stock_code, name_col]
+                        if not row.empty:
+                            return str(row.iloc[0])
         except Exception:
             pass
         return stock_code
@@ -5533,7 +5404,8 @@ class StockScreener:
         results: List[Dict[str, Any]] = []
         lock = threading.Lock()
         early_stop = threading.Event()
-        min_score_threshold = 50
+        strategy_thresholds = {'1': 60, '2': 55, '3': 50, 'all': 55}
+        min_score_threshold = strategy_thresholds.get(strategy, 55)
 
         def process_single_stock(code: str) -> Optional[Dict[str, Any]]:
             try:
@@ -5568,10 +5440,11 @@ class StockScreener:
                 task = progress.add_task("筛选股票...", total=len(valid_codes))
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {executor.submit(worker, code): code for code in valid_codes}
+                    completed = 0
                     for future in as_completed(futures):
+                        completed += 1
                         if early_stop.is_set():
-                            for f in futures:
-                                f.cancel()
+                            progress.update(task, completed=len(valid_codes))
                             break
                         try:
                             progress.advance(task)
@@ -5671,6 +5544,7 @@ class StockScreener:
         1. 优先复用缓存的全市场行情数据（避免重复API调用）
         2. 基于实时行情预过滤无效股票（ST/停牌/涨跌停）
         3. 按策略特征排序候选股（提高命中率）
+        4. 兜底数据源自动采样限制总数，防止全市场遍历耗时过长
 
         Args:
             strategy: 筛选策略，可选值: '1', '2', '3', 'all'
@@ -5678,6 +5552,9 @@ class StockScreener:
         Returns:
             排序后的推荐股票列表
         """
+        _MAX_BATCH = 200
+        _FALLBACK_SAMPLE = 100
+
         log_info("正在获取股票列表...", prefix="")
         _gt_t0 = time.perf_counter()
 
@@ -5698,6 +5575,11 @@ class StockScreener:
             if df is not None and not df.empty:
                 df = df[~df['name'].str.contains('ST|退市', na=False)]
                 stock_codes = df['code'].tolist()
+                if len(stock_codes) > _MAX_BATCH:
+                    log_warning(f"候选股过多({len(stock_codes)}支)，随机采样至{_MAX_BATCH}支", prefix="")
+                    import random
+                    random.seed(42)
+                    stock_codes = random.sample(stock_codes, _MAX_BATCH)
                 log_success(f"Akshare(stock_info) 成功获取 {len(stock_codes)} 支股票", prefix="")
                 result = self.screen_batch(stock_codes, strategy)
                 _gt_total = time.perf_counter()
@@ -5706,7 +5588,7 @@ class StockScreener:
         except Exception as e:
             log_warning(f"Akshare(stock_info) 失败: {str(e)[:50]}", prefix="")
 
-        stock_codes = self._safe_fetch_stock_list(ak.stock_zh_a_spot, "Akshare(新浪)")
+        stock_codes = self._safe_fetch_stock_list(ak.stock_zh_a_spot, "Akshare(新浪)", max_count=_FALLBACK_SAMPLE)
         if stock_codes:
             result = self.screen_batch(stock_codes, strategy)
             _gt_total = time.perf_counter()
@@ -5720,7 +5602,7 @@ class StockScreener:
             df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name')
             if df is not None and not df.empty:
                 df = df[~df['name'].str.contains('ST|退市', na=False)]
-                stock_codes = df['ts_code'].tolist()[:100]
+                stock_codes = df['ts_code'].tolist()[:_FALLBACK_SAMPLE]
                 log_success(f"Tushare 成功获取 {len(stock_codes)} 支股票", prefix="")
                 result = self.screen_batch(stock_codes, strategy)
                 _gt_total = time.perf_counter()
@@ -5733,7 +5615,7 @@ class StockScreener:
             else:
                 log_warning(f"Tushare 失败: {error_msg[:50]}", prefix="")
 
-        stock_codes = self._safe_fetch_stock_list(ak.stock_zh_a_spot_em, "东方财富")
+        stock_codes = self._safe_fetch_stock_list(ak.stock_zh_a_spot_em, "东方财富", max_count=_FALLBACK_SAMPLE)
         if stock_codes:
             result = self.screen_batch(stock_codes, strategy)
             _gt_total = time.perf_counter()
