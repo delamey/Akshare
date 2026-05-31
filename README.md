@@ -81,6 +81,54 @@ pyinstaller Akshare.spec
 # 生成的exe位于 dist/Akshare.exe
 ```
 
+
+## Git LFS 配置（大文件管理）
+
+由于 `dist/Akshare.exe` 超过 50MB，推荐使用 Git LFS（Large File Storage）管理大文件。
+
+### 安装 Git LFS
+
+```bash
+# Windows (下载安装器)
+# https://git-lfs.com
+
+# 或通过包管理器
+winget install Git.LFS
+choco install git-lfs
+
+# macOS
+brew install git-lfs
+
+# Linux
+sudo apt install git-lfs  # Debian/Ubuntu
+sudo yum install git-lfs  # CentOS/RHEL
+```
+
+### 配置仓库
+
+```bash
+# 初始化 Git LFS
+git lfs install
+
+# 追踪 .exe 文件
+git lfs track "dist/*.exe"
+
+# 提交 .gitattributes
+git add .gitattributes
+git commit -m "chore: 配置 Git LFS 追踪大文件"
+
+# 重新添加并推送
+git add dist/Akshare.exe
+git commit -m "chore: 使用 LFS 上传可执行文件"
+git push
+```
+
+> **注意**: 如果已经用普通方式推送过 `Akshare.exe`，需要先迁移到 LFS：
+> ```bash
+> git lfs migrate import --include="dist/*.exe" --everything
+> git push --force
+> ```
+
 ## 许可证
 
 MIT License
