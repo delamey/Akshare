@@ -132,7 +132,7 @@ def _start_warmup_thread():
             for attempt in range(3):
                 try:
                     _t0 = time.perf_counter()
-                    df = _get_cached_market_data("em")
+                    df = _get_cached_market_data("em", silent=True)
                     _t1 = time.perf_counter()
                     elapsed += _t1 - _t0
                     if df is not None and not df.empty:
@@ -179,13 +179,14 @@ def _check_warmup_thread_health() -> bool:
     _start_warmup_thread()
     return True
 
-def _get_cached_market_data(source: str = "em") -> pd.DataFrame:
+def _get_cached_market_data(source: str = "em", silent: bool = False) -> pd.DataFrame:
     """获取全市场行情数据（带缓存和TTL）
 
     缓存有效期5分钟，过期后自动刷新，防止数据过时和内存泄漏。
 
     Args:
         source: 数据源，'em' 东方财富 stock_zh_a_spot_em，'sina' 新浪 stock_zh_a_spot
+        silent: True 时抑制错误日志（用于后台预热等场景）
 
     Returns:
         全市场行情DataFrame，失败时返回空DataFrame
@@ -211,7 +212,8 @@ def _get_cached_market_data(source: str = "em") -> pd.DataFrame:
                 _market_cache[source] = (df, now)
         return df if df is not None else pd.DataFrame()
     except Exception as e:
-        log_warning(f"缓存全市场数据({source})失败: {type(e).__name__}: {str(e)[:60]}")
+        if not silent:
+            log_warning(f"缓存全市场数据({source})失败: {type(e).__name__}: {str(e)[:60]}")
         with _market_cache_lock:
             return _market_cache.get(source, (pd.DataFrame(), 0))[0]
 
