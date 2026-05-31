@@ -20,3 +20,4 @@ Thumbs.db
 *.xlsx
 *.csv
 *.log
+dist/*.exe
