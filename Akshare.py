@@ -98,6 +98,10 @@ _warmup_done = threading.Event()
 _warmup_started = False
 _warmup_started_lock = threading.Lock()
 _warmup_thread_ref: Optional[threading.Thread] = None
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
 
 
 def warmup_market_cache() -> None:
@@ -1064,7 +1068,7 @@ def _fetch_tencent_klines_direct(symbol: str, start_date: str = "", end_date: st
             "r": "0.8205512681390605",
         }
         try:
-            with requests.get(url, params=params, timeout=timeout) as r:
+            with _HTTP_SESSION.get(url, params=params, timeout=timeout) as r:
                 data_text = r.text
             # 解析 JSONP 格式: kline_dayqfq2026={...}
             json_start = data_text.find("={")
@@ -1122,8 +1126,7 @@ def _fetch_tencent_klines_direct(symbol: str, start_date: str = "", end_date: st
 def _fetch_historical_klines_inner(clean_code: str) -> pd.DataFrame:
     """历史K线获取核心逻辑（由 _fetch_historical_klines 包装超时保护）"""
     log_info(f"[{clean_code}] 开始获取历史K线数据...")
-    time.sleep(API_DELAY_MEDIUM)
-    
+
     today = datetime.now()
     one_month_ago = today - timedelta(days=30)
     start_date_str = one_month_ago.strftime("%Y%m%d")
@@ -3901,6 +3904,32 @@ class L1Screener:
                 可选值: 'ma', 'macd', 'rsi', 'kdj', 'bollinger', 'volume_ma'
         """
         _ld_t0 = time.perf_counter()
+
+        def _do_load(retry_label: str = "") -> bool:
+            _ld_rt0 = time.perf_counter()
+            self.realtime_data = self.data_fetcher.get_realtime_data(self.stock_code)
+            _ld_rt1 = time.perf_counter()
+
+            _ld_h0 = time.perf_counter()
+            self.df = self.data_fetcher.get_historical_data(self.stock_code, days=days)
+            _ld_h1 = time.perf_counter()
+
+            if self.df is not None and not self.df.empty:
+                _ld_i0 = time.perf_counter()
+                self._calculate_indicators(indicators)
+                _ld_i1 = time.perf_counter()
+                _ld_total = time.perf_counter()
+                log_info(
+                    f"[{self.stock_code}] L1数据加载完成{retry_label}: "
+                    f"实时={_ld_rt1 - _ld_rt0:.3f}s "
+                    f"历史={_ld_h1 - _ld_h0:.3f}s "
+                    f"指标={_ld_i1 - _ld_i0:.3f}s "
+                    f"总计={_ld_total - _ld_t0:.3f}s"
+                )
+                return True
+
+            return False
+
         try:
             with Progress(
                 SpinnerColumn(),
@@ -3908,61 +3937,25 @@ class L1Screener:
                 console=console
             ) as progress:
                 task = progress.add_task(f"加载 {self.stock_code} 数据...", total=None)
-
-                _ld_rt0 = time.perf_counter()
-                self.realtime_data = self.data_fetcher.get_realtime_data(self.stock_code)
-                _ld_rt1 = time.perf_counter()
-
-                _ld_h0 = time.perf_counter()
-                self.df = self.data_fetcher.get_historical_data(self.stock_code, days=days)
-                _ld_h1 = time.perf_counter()
-
-                if self.df is not None and not self.df.empty:
-                    _ld_i0 = time.perf_counter()
-                    self._calculate_indicators(indicators)
-                    _ld_i1 = time.perf_counter()
-                    _ld_total = time.perf_counter()
-                    log_info(
-                        f"[{self.stock_code}] L1数据加载完成: "
-                        f"实时={_ld_rt1 - _ld_rt0:.3f}s "
-                        f"历史={_ld_h1 - _ld_h0:.3f}s "
-                        f"指标={_ld_i1 - _ld_i0:.3f}s "
-                        f"总计={_ld_total - _ld_t0:.3f}s"
-                    )
-                    progress.update(task, completed=True)
+                ok = _do_load()
+                progress.update(task, completed=True)
+                if ok:
                     return True
-
                 _ld_total = time.perf_counter()
                 log_info(f"[{self.stock_code}] L1数据加载失败: 历史K线为空 (耗时{_ld_total - _ld_t0:.3f}s)")
-                progress.update(task, completed=True)
                 return False
-        except Exception:
+        except (ConnectionError, TimeoutError, OSError) as e:
             try:
-                _ld_rt0 = time.perf_counter()
-                self.realtime_data = self.data_fetcher.get_realtime_data(self.stock_code)
-                _ld_rt1 = time.perf_counter()
-
-                _ld_h0 = time.perf_counter()
-                self.df = self.data_fetcher.get_historical_data(self.stock_code, days=days)
-                _ld_h1 = time.perf_counter()
-
-                if self.df is not None and not self.df.empty:
-                    _ld_i0 = time.perf_counter()
-                    self._calculate_indicators(indicators)
-                    _ld_i1 = time.perf_counter()
-                    _ld_total = time.perf_counter()
-                    log_info(
-                        f"[{self.stock_code}] L1数据加载完成(重试): "
-                        f"实时={_ld_rt1 - _ld_rt0:.3f}s "
-                        f"历史={_ld_h1 - _ld_h0:.3f}s "
-                        f"指标={_ld_i1 - _ld_i0:.3f}s "
-                        f"总计={_ld_total - _ld_t0:.3f}s"
-                    )
+                if _do_load("(重试)"):
                     return True
             except Exception:
                 pass
             _ld_total = time.perf_counter()
             log_info(f"[{self.stock_code}] L1数据加载最终失败 (耗时{_ld_total - _ld_t0:.3f}s)")
+            return False
+        except Exception as e:
+            _ld_total = time.perf_counter()
+            log_info(f"[{self.stock_code}] L1数据加载失败({type(e).__name__}) (耗时{_ld_total - _ld_t0:.3f}s)")
             return False
 
     def _calculate_indicators(self, indicators: Optional[List[str]] = None) -> None:
@@ -5369,14 +5362,16 @@ class StockScreener:
         """
         self.max_recommendations = max_recommendations
         
-    def screen_single_stock(self, stock_code: str, strategy: str = 'all') -> Dict[str, Any]:
+    def screen_single_stock(self, stock_code: str, strategy: str = 'all',
+                                stock_name: Optional[str] = None) -> Dict[str, Any]:
         """
         对单支股票进行筛选分析
-        
+
         Args:
             stock_code: 股票代码
             strategy: 筛选策略，可选值: '1'(短线强势), '2'(主力建仓), '3'(价值投资), 'all'(全部)
-            
+            stock_name: 股票名称，如已预取可传入避免重复查询缓存
+
         Returns:
             包含筛选结果的字典，结构为:
             {
@@ -5412,7 +5407,8 @@ class StockScreener:
         screener = ScreeningStrategies(stock_code)
 
         _ss_n0 = time.perf_counter()
-        stock_name = self._get_stock_name(stock_code)
+        if stock_name is None:
+            stock_name = self._get_stock_name(stock_code)
         _ss_n1 = time.perf_counter()
 
         results = {
@@ -5429,16 +5425,32 @@ class StockScreener:
             elif strategy == '3':
                 results['strategies']['价值投资股'] = screener.strategy_value_stocks()
         else:
-            if not screener.load_all_data('all'):
+            if not screener.load_all_data('1'):
                 results['strategies'] = {
                     '短线强势股': {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'},
                     '主力建仓股': {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'},
                     '价值投资股': {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'},
                 }
             else:
-                results['strategies']['短线强势股'] = screener.strategy_short_term_strong()
-                results['strategies']['主力建仓股'] = screener.strategy_main_accumulation()
-                results['strategies']['价值投资股'] = screener.strategy_value_stocks()
+                s1 = screener.strategy_short_term_strong()
+                results['strategies']['短线强势股'] = s1
+
+                s2 = {'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'}
+                if screener.load_all_data('2'):
+                    s2 = screener.strategy_main_accumulation()
+                results['strategies']['主力建仓股'] = s2
+
+                if s1.get('score', 0) < 30 and s2.get('score', 0) < 30:
+                    results['strategies']['价值投资股'] = {
+                        'score': 0, 'max_score': 100, 'details': [],
+                        'skip_reason': '短线/中线得分过低，跳过深度分析'
+                    }
+                elif screener.load_all_data('3'):
+                    results['strategies']['价值投资股'] = screener.strategy_value_stocks()
+                else:
+                    results['strategies']['价值投资股'] = {
+                        'score': 0, 'max_score': 100, 'details': [], 'error': '数据加载失败'
+                    }
         
         total_score = 0
         strategy_count = 0
@@ -5503,6 +5515,21 @@ class StockScreener:
             log_info("批量筛选完成: 输入={}支 有效=0支 耗时=0.000s".format(len(stock_codes)))
             return []
 
+        _sb_name0 = time.perf_counter()
+        name_map: Dict[str, str] = {}
+        try:
+            df = _get_cached_market_data("em")
+            if df is not None and not df.empty:
+                code_col = '代码' if '代码' in df.columns else None
+                name_col = '名称' if '名称' in df.columns else None
+                if code_col and name_col:
+                    name_map = dict(zip(df[code_col].astype(str), df[name_col].astype(str)))
+        except Exception:
+            pass
+        _sb_name1 = time.perf_counter()
+        if name_map:
+            log_info(f"名称映射预取完成: {len(name_map)}条 ({_sb_name1 - _sb_name0:.3f}s)")
+
         results: List[Dict[str, Any]] = []
         lock = threading.Lock()
         early_stop = threading.Event()
@@ -5510,7 +5537,7 @@ class StockScreener:
 
         def process_single_stock(code: str) -> Optional[Dict[str, Any]]:
             try:
-                return self.screen_single_stock(code, strategy)
+                return self.screen_single_stock(code, strategy, stock_name=name_map.get(code))
             except Exception as e:
                 log_warning(f"筛选 {code} 时出错: {str(e)[:40]}")
                 return None
@@ -5527,7 +5554,8 @@ class StockScreener:
                         early_stop.set()
             return result
 
-        max_workers = min(3, len(valid_codes))
+        base_workers = 5 if strategy in ('1', '2') else 3
+        max_workers = min(base_workers, len(valid_codes))
 
         try:
             with Progress(
@@ -5726,24 +5754,26 @@ class StockScreener:
         - 价值投资(3)：按市盈率升序（低估值优先）
         - all：按涨跌幅降序
         """
-        df = market_df.copy()
-
-        name_col = next((c for c in df.columns if '名称' in str(c) or 'name' in str(c).lower()), None)
-        code_col = next((c for c in df.columns if '代码' in str(c) or 'code' in str(c).lower()), None)
+        name_col = next((c for c in market_df.columns if '名称' in str(c) or 'name' in str(c).lower()), None)
+        code_col = next((c for c in market_df.columns if '代码' in str(c) or 'code' in str(c).lower()), None)
         if code_col is None:
             return []
 
+        mask = pd.Series(True, index=market_df.index)
         if name_col:
-            df = df[~df[name_col].str.contains('ST|退市', na=False)]
+            mask &= ~market_df[name_col].astype(str).str.contains('ST|退市', na=False)
 
-        change_col = next((c for c in df.columns if '涨跌幅' in str(c) or 'changepercent' in str(c).lower()), None)
+        change_col = next((c for c in market_df.columns if '涨跌幅' in str(c) or 'changepercent' in str(c).lower()), None)
         if change_col:
-            df = df[pd.to_numeric(df[change_col], errors='coerce').notna()]
-            df = df[~(pd.to_numeric(df[change_col], errors='coerce').abs() >= 9.9)]
+            change_vals = pd.to_numeric(market_df[change_col], errors='coerce')
+            mask &= change_vals.notna() & (change_vals.abs() < 9.9)
 
-        vol_col = next((c for c in df.columns if '成交量' in str(c) or 'volume' in str(c).lower()), None)
+        vol_col = next((c for c in market_df.columns if '成交量' in str(c) or 'volume' in str(c).lower()), None)
         if vol_col:
-            df = df[pd.to_numeric(df[vol_col], errors='coerce').fillna(0) > 0]
+            vol_vals = pd.to_numeric(market_df[vol_col], errors='coerce').fillna(0)
+            mask &= vol_vals > 0
+
+        df = market_df.loc[mask]
 
         sort_col = change_col
         ascending = False
@@ -5756,12 +5786,15 @@ class StockScreener:
             if pe_col:
                 sort_col = pe_col
                 ascending = True
-                df = df[pd.to_numeric(df[pe_col], errors='coerce') > 0]
+                pe_vals = pd.to_numeric(market_df[pe_col], errors='coerce')
+                df = df.loc[pe_vals.loc[df.index] > 0]
 
         if sort_col and sort_col in df.columns:
-            df[sort_col] = pd.to_numeric(df[sort_col], errors='coerce')
-            df = df.dropna(subset=[sort_col])
-            df = df.sort_values(sort_col, ascending=ascending)
+            sort_vals = pd.to_numeric(df[sort_col], errors='coerce')
+            df = df.loc[sort_vals.notna()]
+            df = df.iloc[sort_vals[sort_vals.notna()].argsort()]
+            if not ascending:
+                df = df.iloc[::-1]
 
         n = min(self.max_recommendations * 5, len(df))
         return df[code_col].head(n).tolist()
