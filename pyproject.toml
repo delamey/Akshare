@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "akshare-app"
+version = "3.0.0"
+description = "A股数据查询工具 - 基于Akshare的股票数据采集、分析和智能筛选系统"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Akshare App Team"},
+]
+dependencies = [
+    "akshare>=1.18.0",
+    "tushare>=1.4.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "rich>=13.0.0",
+    "requests>=2.31.0",
+    "openpyxl>=3.1.0",
+    "tqdm>=4.65.0",
+    "yfinance>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+build = [
+    "pyinstaller>=6.0.0",
+    "curl_cffi>=0.5.0",
+]
+
+[project.scripts]
+akshare-app = "akshare_app.main:main_with_error_handling"
+
+[tool.setuptools.packages.find]
+include = [
+    "akshare_app*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
